@@ -37,6 +37,23 @@ func TestRenderTemplateHTTP(t *testing.T) {
 	}
 }
 
+func TestRenderTemplateDoesNotExpandParameterData(t *testing.T) {
+	params := map[string]any{"a": "{b}", "b": "; printf INJECTED; #", "json": []any{"{a}", "a'b"}}
+	for range 100 { // Exercise different Go map iteration orders.
+		got := renderTemplate("printf %s {a} {b} {a} {missing} {json}", params, shellQuote)
+		want := "printf %s '{b}' '; printf INJECTED; #' '{b}' {missing} " + shellQuote(`["{a}","a'b"]`)
+		if got != want {
+			t.Fatalf("parameter data was reinterpreted: %q", got)
+		}
+		if got := renderTemplate("/{a}/{b}", params, identity); got != "/{b}/; printf INJECTED; #" {
+			t.Fatalf("HTTP parameter data was reinterpreted: %q", got)
+		}
+	}
+	if got := renderTemplate("{a-b}/{中文}/{a-b}", map[string]any{"a-b": "x", "中文": "值"}, identity); got != "x/值/x" {
+		t.Fatalf("arbitrary property names regressed: %q", got)
+	}
+}
+
 func TestScalarStr(t *testing.T) {
 	cases := []struct {
 		v    any

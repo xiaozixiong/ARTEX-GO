@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -151,7 +152,7 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 	w := csv.NewWriter(&buf)
 	_ = w.Write([]string{"ID", "名称", "类别", "严重等级", "状态", "所属任务", "发现时间", "概述", "流量证据数量", "流量证据ID"})
 	for _, f := range items {
-		_ = w.Write([]string{
+		row := []string{
 			fmt.Sprintf("%d", f.ID),
 			findingTitle(f),
 			f.VulnClass,
@@ -161,10 +162,28 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 			f.CreatedAt.Format("2006-01-02 15:04:05"),
 			strings.TrimSpace(f.Summary),
 			fmt.Sprint(len(f.TrafficBindings)), findingTrafficIDs(f),
-		})
+		}
+		for i, cell := range row {
+			row[i] = csvTextCell(cell)
+		}
+		_ = w.Write(row)
 	}
 	w.Flush()
 	return buf.Bytes()
+}
+
+// csvTextCell keeps low-trust text from becoming a spreadsheet formula. Check
+// after ignoring whitespace/control/format characters that readers may discard,
+// but preserve the original text and ordinary CSV escaping.
+func csvTextCell(s string) string {
+	visible := strings.TrimLeftFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+	})
+	if strings.HasPrefix(visible, "=") || strings.HasPrefix(visible, "+") ||
+		strings.HasPrefix(visible, "-") || strings.HasPrefix(visible, "@") {
+		return "'" + s
+	}
+	return s
 }
 
 func findingTrafficIDs(f *db.DBFinding) string {

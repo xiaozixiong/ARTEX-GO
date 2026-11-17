@@ -14,20 +14,53 @@ the same origin and extracts:
 
 Stdlib only. Same-origin, bounded, polite. Provide --cookie for an authed crawl.
 """
-import sys, os, re, ssl, argparse, urllib.request, urllib.parse, time
+import sys, os, re, ssl, argparse, urllib.request, urllib.parse, urllib.error, time
 from html.parser import HTMLParser
 from collections import deque
 
-CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
 UA = "Mozilla/5.0 (spa-api-recon spider)"
 SKIP_EXT = re.compile(r'\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf|pdf|zip|mp4|webp|js)(\?|$)', re.I)
 API_HINT = re.compile(r'/(?:api|rest|service|ajax|action|do|rpc|graphql|v\d|admin|backend)\b', re.I)
 
-def fetch(url, cookie):
+def url_origin(url):
+    """Return an HTTP(S) origin; reject ambiguous/credential-bearing URLs."""
+    try:
+        p = urllib.parse.urlsplit(url)
+        scheme = p.scheme.lower()
+        if scheme not in ("http", "https") or not p.hostname or p.username is not None or p.password is not None:
+            return None
+        return scheme, p.hostname.lower(), p.port if p.port is not None else (443 if scheme == "https" else 80)
+    except ValueError:
+        return None
+
+
+class OriginRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, origin):
+        self.origin = origin
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if url_origin(newurl) != self.origin:
+            raise urllib.error.URLError("cross-origin redirect refused")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def make_opener(origin, ca_file=None, insecure=False):
+    context = ssl.create_default_context(cafile=ca_file)
+    if insecure:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return urllib.request.build_opener(
+        OriginRedirectHandler(origin), urllib.request.HTTPSHandler(context=context))
+
+
+def fetch(url, cookie, origin, opener):
+    # Enforce at the send boundary too, not only when discovering links.
+    if origin is None or url_origin(url) != origin:
+        return "", ""
     h = {"User-Agent": UA}
     if cookie: h["Cookie"] = cookie
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=h), context=CTX, timeout=20) as r:
+        with opener.open(urllib.request.Request(url, headers=h), timeout=20) as r:
             ct = r.headers.get("Content-Type", "")
             if "html" not in ct and "xml" not in ct: return "", ct
             return r.read().decode("utf-8", "ignore"), ct
@@ -70,8 +103,14 @@ def main():
     ap.add_argument("--cookie", default=""); ap.add_argument("--max", type=int, default=200)
     ap.add_argument("--depth", type=int, default=4); ap.add_argument("--delay", type=float, default=0.1)
     ap.add_argument("--include", default=""); ap.add_argument("--exclude", default="logout|signout|delete|remove|destroy")
+    ap.add_argument("--ca-file", help="trusted CA PEM file for a private/self-signed target")
+    ap.add_argument("--insecure", action="store_true", help="explicitly skip TLS verification for this origin only")
     args = ap.parse_args()
     base = args.base if args.base.startswith("http") else "https://" + args.base
+    target_origin = url_origin(base)
+    if target_origin is None:
+        ap.error("base must be an HTTP(S) URL without userinfo and with a valid port")
+    opener = make_opener(target_origin, args.ca_file, args.insecure)
     os.makedirs(args.outdir, exist_ok=True)
     origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(base))
     inc = re.compile(args.include) if args.include else None
@@ -82,7 +121,7 @@ def main():
     n = 0
     while q and n < args.max:
         url, d = q.popleft(); n += 1
-        html, ct = fetch(url, args.cookie)
+        html, ct = fetch(url, args.cookie, target_origin, opener)
         if args.delay: time.sleep(args.delay)
         if not html: continue
         p = Page()
@@ -98,7 +137,7 @@ def main():
             for href in p.links:
                 if href.startswith(("mailto:", "tel:", "javascript:", "#")): continue
                 nxt = urllib.parse.urljoin(url, href).split("#")[0]
-                if not nxt.startswith(origin): continue
+                if url_origin(nxt) != target_origin: continue
                 if SKIP_EXT.search(nxt): continue
                 if exc and exc.search(nxt): continue
                 if inc and not inc.search(nxt): continue

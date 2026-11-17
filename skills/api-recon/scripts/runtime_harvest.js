@@ -32,13 +32,8 @@
  *   "waitMs": 1200, "perRouteMs": 900, "headless": true
  * }
  */
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const fs = require('fs');
 const path = require('path');
-
-let puppeteer;
-try { puppeteer = require('puppeteer-core'); }
-catch (e) { console.error("[!] run `npm install` in the scripts/ dir first (needs puppeteer-core)"); process.exit(1); }
 
 function loadCfg(p) {
   const c = JSON.parse(fs.readFileSync(p, 'utf8'));
@@ -69,6 +64,76 @@ function cookieValue(v) {
   return v;
 }
 
+function sameOrigin(url, origin) {
+  try {
+    const parsed = new URL(url);
+    return /^(https?:)$/.test(parsed.protocol) && !parsed.username && !parsed.password && parsed.origin === origin;
+  } catch { return false; }
+}
+
+function requestHeaders(headers, url, origin, cookies) {
+  const same = sameOrigin(url, origin);
+  const out = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!same && /^(cookie|authorization|proxy-authorization)$/i.test(key)) continue;
+    if (same && cookies && /^cookie$/i.test(key)) continue;
+    out[key] = value;
+  }
+  if (same && cookies) {
+    const pathname = new URL(url).pathname;
+    out.cookie = cookies.filter(c => {
+      const p = c.path || '/';
+      return pathname === p || pathname.startsWith(p.endsWith('/') ? p : p + '/');
+    }).sort((a, b) => (b.path || '/').length - (a.path || '/').length)
+      .map(c => `${c.name}=${cookieValue(c.value)}`).join('; ');
+  }
+  return out;
+}
+
+// Do not put configured credentials in Chromium's domain cookie jar: even a
+// host-only cookie spans ports. Expose the render-gate values only to the exact
+// target document; HTTP credentials are injected separately at the send boundary.
+function injectAuthState(storage, cookies, origin) {
+  if (location.origin !== origin) return;
+  if (storage) {
+    try { for (const [k, v] of Object.entries(storage)) localStorage.setItem(k, v); } catch {}
+  }
+  if (cookies && cookies.length) {
+    const native = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie');
+    Object.defineProperty(document, 'cookie', {
+      configurable: true,
+      get() {
+        const configured = cookies.filter(c => {
+          const p = c.path || '/';
+          return location.pathname === p || location.pathname.startsWith(p.endsWith('/') ? p : p + '/');
+        }).sort((a, b) => (b.path || '/').length - (a.path || '/').length)
+          .map(c => `${c.name}=${c.value}`).join('; ');
+        return [native.get.call(document), configured].filter(Boolean).join('; ');
+      },
+      set(value) { native.set.call(document, value); }
+    });
+  }
+}
+
+async function forwardRequest(url, options, origin, fetcher = fetch) {
+  let current = url;
+  let opts = { ...options, redirect: 'manual' };
+  for (let hops = 0; hops <= 10; hops++) {
+    if (!sameOrigin(current, origin)) throw new Error('cross-origin forwarding refused');
+    const response = await fetcher(current, opts);
+    const next = response.headers.get('location');
+    if (![301, 302, 303, 307, 308].includes(response.status) || !next) return response;
+    await response.body?.cancel();
+    if (hops === 10) throw new Error('too many redirects');
+    current = new URL(next, current).href;
+    if ((response.status === 303 && opts.method !== 'HEAD') ||
+        ([301, 302].includes(response.status) && opts.method === 'POST')) {
+      const headers = Object.fromEntries(Object.entries(opts.headers).filter(([k]) => !/^(content-type|content-length)$/i.test(k)));
+      opts = { ...opts, method: 'GET', body: undefined, headers };
+    }
+  }
+}
+
 function neutralize(txt, n) {
   try {
     const j = JSON.parse(txt);
@@ -81,10 +146,13 @@ function neutralize(txt, n) {
   return txt;
 }
 
-(async () => {
-  const cfg = loadCfg(process.argv[2] || 'config.json');
+async function main(configPath = process.argv[2] || 'config.json') {
+  let puppeteer;
+  try { puppeteer = require('puppeteer-core'); }
+  catch { throw new Error('run `npm install` in the scripts/ dir first (needs puppeteer-core)'); }
+  const cfg = loadCfg(configPath);
   const origin = new URL(cfg.baseUrl).origin;
-  const host = new URL(cfg.baseUrl).hostname;
+  if (!sameOrigin(cfg.baseUrl, origin)) throw new Error('baseUrl must be HTTP(S) without userinfo');
   const rec = [];           // {m,u,b,resp,ct}
   const chunks = new Set();
   const ws = [];            // {url,dir,data}  WebSocket frames
@@ -94,7 +162,7 @@ function neutralize(txt, n) {
     process.env.HTTP_PROXY = cfg.proxy;
     process.env.HTTPS_PROXY = cfg.proxy;
   }
-  const launchArgs = ['--no-sandbox', '--disable-dev-shm-usage', '--ignore-certificate-errors'];
+  const launchArgs = ['--no-sandbox', '--disable-dev-shm-usage'];
   if (cfg.proxy) launchArgs.push(`--proxy-server=${cfg.proxy}`);
   const browser = await puppeteer.launch({
     executablePath: cfg.chromium, headless: cfg.headless ? 'new' : false,
@@ -118,12 +186,8 @@ function neutralize(txt, n) {
     } catch (e) { console.log('[ws] CDP capture unavailable:', e.message); }
   }
 
-  // inject localStorage on every document
-  if (cfg.localStorage) {
-    await page.evaluateOnNewDocument((kv) => {
-      try { for (const k in kv) localStorage.setItem(k, kv[k]); } catch (e) {}
-    }, cfg.localStorage);
-  }
+  await page.evaluateOnNewDocument(injectAuthState, cfg.localStorage,
+    cfg.cookies?.map(c => ({ name: c.name, value: cookieValue(c.value), path: c.path || '/' })), origin);
   // fallback: block full-page navigations to the login url
   await page.evaluateOnNewDocument((pat) => {
     const bad = u => { try { return String(u).indexOf(pat) >= 0; } catch (e) { return false; } };
@@ -141,6 +205,19 @@ function neutralize(txt, n) {
   await page.setRequestInterception(true);
   page.on('request', async (req) => {
     const u = req.url(), m = req.method();
+    const frame = req.frame(), incoming = req.headers();
+    // A foreign document must not turn a credentialless CORS request back to
+    // the target into an authenticated one. Unknown frames fail closed; the
+    // initial top-level navigation is the only about:blank bootstrap exception.
+    const trustedCaller = (req.isNavigationRequest() && frame === page.mainFrame()) ||
+      (frame && sameOrigin(frame.url(), origin));
+    const authenticated = trustedCaller && sameOrigin(u, origin) &&
+      (!incoming.origin || sameOrigin(incoming.origin, origin)) &&
+      (!incoming.referer || sameOrigin(incoming.referer, origin));
+    const headers = requestHeaders(incoming, u, authenticated ? origin : null, cfg.cookies);
+    // Includes documents, frames and non-API resources. Never replay target
+    // authentication to third parties, even on the same hostname at another port.
+    if (!authenticated) return req.continue({ headers });
     if (/\.js(\?|$)/.test(u) && /\/assets\/|\/static\/|\/js\//.test(u)) chunks.add(u.split('/').pop());
 
     // suppress fallback login navigations (after the app has bootstrapped)
@@ -148,7 +225,7 @@ function neutralize(txt, n) {
         && u.includes(cfg.loginUrlPattern) && rec.length > 3) {
       return req.respond({ status: 204, body: '' });
     }
-    if (!cfg.apiPattern.test(u)) return req.continue();
+    if (!cfg.apiPattern.test(u)) return req.continue({ headers });
 
     const entry = { m, u: u.replace(origin, '').split('?')[0], full: u, b: req.postData() ? req.postData().slice(0, 400) : null };
     rec.push(entry);
@@ -167,9 +244,7 @@ function neutralize(txt, n) {
     }
     // forward real request, then rewrite the unauthorized code field
     try {
-      const headers = Object.assign({}, req.headers());
-      if (cfg.cookies) headers.cookie = cfg.cookies.map(c => `${c.name}=${cookieValue(c.value)}`).join('; ');
-      const r = await fetch(u, { method: m, headers, body: (m !== 'GET' && m !== 'HEAD') ? req.postData() : undefined });
+      const r = await forwardRequest(u, { method: m, headers, body: (m !== 'GET' && m !== 'HEAD') ? req.postData() : undefined }, origin);
       const t = await r.text();
       if (cfg.captureResponses) { entry.resp = t.slice(0, cfg.respMax); entry.ct = r.headers.get('content-type') || ''; }
       req.respond({ status: 200, contentType: 'application/json', body: neutralize(t, cfg.neutralize) });
@@ -177,12 +252,6 @@ function neutralize(txt, n) {
       req.respond({ status: 200, contentType: 'application/json', body: '{"response_code":0,"code":0,"data":{}}' });
     }
   });
-
-  // set auth cookies
-  if (cfg.cookies) {
-    for (const c of cfg.cookies)
-      await page.setCookie({ name: c.name, value: cookieValue(c.value), domain: host, path: c.path || '/' });
-  }
 
   // boot
   await page.goto(cfg.baseUrl, { waitUntil: cfg.waitUntil, timeout: 45000 }).catch(e => console.log('[goto]', e.message));
@@ -208,7 +277,7 @@ function neutralize(txt, n) {
 
   const uniq = [...new Set(rec.map(r => r.m + ' ' + r.u))].sort();
   const wsUniq = [...new Set(ws.map(f => f.url))].filter(Boolean).sort();
-  const outdir = path.dirname(process.argv[2] || '.');
+  const outdir = path.dirname(configPath);
   fs.writeFileSync(path.join(outdir, 'runtime_api.json'),
     JSON.stringify({ shell, uniq, perRoute, rec, ws, wsEndpoints: wsUniq, sse: [...sse] }, null, 2));
 
@@ -225,4 +294,7 @@ function neutralize(txt, n) {
   console.log(`[+] merged unique paths: ${merged.size}  -> api_merged.txt`);
   console.log(`[+] full detail -> runtime_api.json (per-route + bodies + ws frames + sse)`);
   await browser.close();
-})();
+}
+
+module.exports = { sameOrigin, requestHeaders, injectAuthState, forwardRequest, cookieValue, main };
+if (require.main === module) main().catch(error => { console.error('[!]', error.message); process.exitCode = 1; });

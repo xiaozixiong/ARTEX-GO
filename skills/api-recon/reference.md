@@ -292,6 +292,10 @@ grep -rhoaE '/api/[a-zA-Z0-9_./-]+' js | sort -u
 - **静态足够做 endpoint 枚举** — 模块 path 在代码里
 - 若授权允许，用**真实会话**跑同一 harness：`forward: true`、无需 neutralize，捕获真实 methods/params/responses
 
+认证采集默认验证 HTTPS 证书。私有 CA：MPA 爬虫使用 `--ca-file ca.pem`；Node 转发启动前设置 `NODE_EXTRA_CA_CERTS=ca.pem`，同时将 CA 加入所用 Chromium 的受信任证书库。MPA 仅在明确授权的自签目标上可显式传 `--insecure`，其请求与重定向仍限于目标的精确来源；运行时采集器不再全局忽略证书错误。
+
+`cookies` 与 `localStorage` 只注入 `baseUrl` 的精确来源（协议、主机、有效端口）。跨来源请求和外站文档发回目标的请求均不会复制 Cookie/Authorization，认证转发也不跟随跨来源重定向。配置 Cookie 保留路径匹配，通过同源 HTTP 请求头和同源文档的 `document.cookie` 视图提供，不写入浏览器域 Cookie 容器，避免子域、其他端口的页面或弹窗读取这些值。因此它们不会自动用于浏览器原生 WebSocket 握手；WebSocket 帧录制仍可用，需 Cookie 握手认证的目标须单独设计并审查认证方式。
+
 ---
 
 ## H. 单次任务清单

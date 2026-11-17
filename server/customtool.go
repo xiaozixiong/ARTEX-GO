@@ -495,11 +495,13 @@ func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''
 
 // renderTemplate replaces {name} placeholders with each param's rendered value.
 func renderTemplate(tmpl string, params map[string]any, quote func(string) string) string {
-	out := tmpl
+	replacements := make([]string, 0, len(params)*2)
 	for k, v := range params {
-		out = strings.ReplaceAll(out, "{"+k+"}", quote(valToStr(v)))
+		replacements = append(replacements, "{"+k+"}", quote(valToStr(v)))
 	}
-	return out
+	// NewReplacer scans the original template once; inserted data is never
+	// interpreted as another placeholder (or stripped of its shell quoting).
+	return strings.NewReplacer(replacements...).Replace(tmpl)
 }
 
 // valToStr renders a param value: scalars as-is, arrays/objects as compact JSON.
